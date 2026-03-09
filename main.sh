@@ -1,226 +1,376 @@
 #!/usr/bin/env bash
 
-# Check dependencies
-for cmd in jira fzf; do
-    if ! command -v "$cmd" &> /dev/null; then
-        echo "Error: $cmd is not installed." >&2
-        exit 1
-    fi
-done
+# ==============================================================================
+# CONFIGURATION & CONSTANTS
+# ==============================================================================
 
 # Defaults
-CURRENT_USER=$(jira me 2>/dev/null)
-# Default project from jira config or first one from list
-CURRENT_PROJECT=$(jira project list --plain --no-headers 2>/dev/null | head -n1 | awk '{print $1}')
-[[ -z "$CURRENT_PROJECT" ]] && CURRENT_PROJECT="INFRA"
+DEFAULT_LABELS="bug feature documentation enhancement help-wanted question"
+DEFAULT_COMPONENTS="frontend backend database api ui infrastructure"
 
-# Caches for performance (session-based)
+# Configuration Paths
+CONFIG_DIR=".jira-config"
+LABEL_FILE="$CONFIG_DIR/labels.txt"
+COMPONENT_FILE="$CONFIG_DIR/components.txt"
 CACHE_DIR="/tmp/jira-cli-fzf-$USER"
-mkdir -p "$CACHE_DIR"
 
-# Utility: format fzf output
-# fzf returns the selection (or empty if cancelled)
-# If --expect is used, first line is the key pressed, second is the selection
-parse_fzf() {
-    local out="$1"
-    echo "$out" | tail -n+2
+# Global State
+CURRENT_USER=""
+CURRENT_PROJECT=""
+
+# ==============================================================================
+# UTILITIES & LOGGING
+# ==============================================================================
+
+log_error() {
+    echo "Error: $1" >&2
 }
 
-parse_key() {
-    local out="$1"
-    echo "$out" | head -n1
+log_info() {
+    echo "Info: $1"
 }
 
-get_recent_labels() {
-    local cache="$CACHE_DIR/labels-$CURRENT_PROJECT"
-    if [[ ! -f "$cache" ]] || [[ $(find "$cache" -mmin +60) ]]; then
-        # Column 1 is KEY, Column 2 is LABELS. We want everything after the first column (the labels)
-        jira issue list --project="$CURRENT_PROJECT" --plain --columns LABELS --no-headers --paginate 300 2>/dev/null | \
-            awk '{$1=""; print $0}' | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | sort -u | grep -v '^$' > "$cache"
-    fi
-    cat "$cache"
+check_dependencies() {
+    for cmd in jira fzf; do
+        if ! command -v "$cmd" &> /dev/null; then
+            log_error "$cmd is not installed."
+            exit 1
+        fi
+    done
 }
 
-get_recent_components() {
-    # Components are harder to fetch without a dedicated command, we'll try same logic as labels
-    # but jira-cli might not have a COMPONENT column in list?
-    # Let's check for COMPONENTS column if possible, otherwise fallback to predefined.
-    local cache="$CACHE_DIR/components-$CURRENT_PROJECT"
-    if [[ ! -f "$cache" ]] || [[ $(find "$cache" -mmin +60) ]]; then
-         jira issue list --project="$CURRENT_PROJECT" --plain --columns COMPONENTS --no-headers --paginate 300 2>/dev/null | \
-            awk '{$1=""; print $0}' | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | sort -u | grep -v '^$' > "$cache"
-    fi
-    if [[ -s "$cache" ]]; then
-        cat "$cache"
+ensure_config_dirs() {
+    mkdir -p "$CACHE_DIR"
+    # Note: We do NOT auto-create CONFIG_DIR per requirements, only use it if exists
+}
+
+# fzf helpers
+parse_fzf_selection() {
+    echo "$1" | tail -n+2
+}
+
+parse_fzf_key() {
+    echo "$1" | head -n1
+}
+
+# ==============================================================================
+# DATA PERSISTENCE & RETRIEVAL
+# ==============================================================================
+
+init_session() {
+    CURRENT_USER=$(jira me 2>/dev/null)
+    # Default project from jira config or first one from list
+    CURRENT_PROJECT=$(jira project list --plain --no-headers 2>/dev/null | head -n1 | awk '{print $1}')
+    [[ -z "$CURRENT_PROJECT" ]] && CURRENT_PROJECT="INFRA"
+}
+
+get_list_from_file_or_default() {
+    local file="$1"
+    local defaults="$2"
+    if [[ -f "$file" ]]; then
+        sort -u "$file"
     else
-        echo -e "frontend\nbackend\ndatabase\napi\nui\ninfrastructure"
+        echo "$defaults" | tr ' ' '\n'
     fi
+}
+
+save_item_to_file() {
+    local item="$1"
+    local file="$2"
+    [[ -z "$item" || ! -d "$CONFIG_DIR" ]] && return
+
+    # Ensure file exists before grepping
+    touch "$file"
+    if ! grep -qx "$item" "$file"; then
+        echo "$item" >> "$file"
+    fi
+}
+
+get_labels() {
+    get_list_from_file_or_default "$LABEL_FILE" "$DEFAULT_LABELS"
+}
+
+get_components() {
+    get_list_from_file_or_default "$COMPONENT_FILE" "$DEFAULT_COMPONENTS"
+}
+
+# ==============================================================================
+# UI COMPONENTS (SELECTION MENUS)
+# ==============================================================================
+
+select_generic_multi() {
+    local prompt="$1"
+    local source_func="$2"     # e.g., "get_labels"
+    local save_func="$3"       # Function to save new item
+    local type_name="$4"       # e.g. "Label" or "Component"
+    local file_path="$5"       # Path to save to
+
+    local CREATE_OPTION="+ Create New $type_name..."
+    local -a current_selection=()
+
+    while true; do
+        local source_data
+        source_data=$($source_func)
+
+        # Filter out already selected items from the source to prevent duplicates in list
+        local display_source="$source_data"
+        if [[ ${#current_selection[@]} -gt 0 ]]; then
+            # Use grep to exclude lines that match exactly
+            # We construct a pattern like ^item1$|^item2$
+            local pattern=""
+            for item in "${current_selection[@]}"; do
+                pattern="${pattern}^${item}$|"
+            done
+            pattern=${pattern%|} # remove trailing pipe
+
+            if [[ -n "$pattern" ]]; then
+                display_source=$(echo "$source_data" | grep -vE "$pattern")
+            fi
+        fi
+
+        # Prepend the Create Option
+        display_source=$(echo -e "$CREATE_OPTION\n$display_source")
+
+        local selection_str
+        selection_str=$(IFS=','; echo "${current_selection[*]}")
+        local header
+        header=$(echo -e "Current: [ $selection_str ]\nTAB: Multi-select | ENTER: Confirm Selection / Create New")
+
+        local fzf_out
+        fzf_out=$(echo "$display_source" | \
+            fzf --multi --prompt="$prompt > " --height=40% --layout=reverse --border \
+                --header-first --header="$header")
+
+        local exit_code=$?
+        [[ $exit_code -ne 0 ]] && return # Cancelled
+
+        # Check for Create Option
+        local creating_new=false
+        if echo "$fzf_out" | grep -Fq "$CREATE_OPTION"; then
+            creating_new=true
+            local new_item
+            read -p "Enter new $type_name: " new_item
+            if [[ -n "$new_item" ]]; then
+                save_item_to_file "$new_item" "$file_path"
+                current_selection+=("$new_item")
+            fi
+            # Remove create option line from output to process rest
+            fzf_out=$(echo "$fzf_out" | grep -vF "$CREATE_OPTION")
+        fi
+
+        # Add other selected items
+        while read -r item; do
+            [[ -n "$item" ]] && current_selection+=("$item")
+        done <<< "$fzf_out"
+
+        # If we were not creating new, then the Enter key meant "Confirm Selection"
+        if ! $creating_new; then
+            break
+        fi
+
+        # Loop back to show updated list (with new items in 'Current' header)
+    done
+
+    # Output final selection
+    printf "%s\n" "${current_selection[@]}"
 }
 
 select_project() {
-    local SELECTED=$(jira project list 2>/dev/null | grep -v '^+' | \
+    local selected
+    selected=$(jira project list 2>/dev/null | grep -v '^+' | \
         fzf --prompt="Select Project > " \
             --height=40% --layout=reverse --border --header-lines=1 \
             --info=inline)
 
-    if [[ -n "$SELECTED" ]]; then
-        CURRENT_PROJECT=$(echo "$SELECTED" | awk '{print $1}')
+    if [[ -n "$selected" ]]; then
+        CURRENT_PROJECT=$(echo "$selected" | awk '{print $1}')
     fi
 }
 
-create_issue() {
+select_issue_type() {
+    echo -e "Task\nStory\nBug\nEpic\nSub-task" | \
+        fzf --prompt="Issue Type > " --height=40% --layout=reverse --border
+}
+
+select_epic() {
+    echo "Fetching Epics..." >&2
+    local selected_epic
+    # Fetch only KEY and SUMMARY for cleaner display
+    selected_epic=$(jira epic list --plain --columns KEY,SUMMARY --no-headers --project="$CURRENT_PROJECT" 2>/dev/null | \
+        fzf --prompt="Link to Epic (Optional, ESC to skip) > " --height=40% --layout=reverse --border --header="Select parent Epic")
+
+    echo "$selected_epic"
+}
+select_assignee() {
+    local option
+    option=$(echo -e "Me ($CURRENT_USER)\nUnassigned\nSearch/Manual..." | \
+        fzf --prompt="Assignee (ESC to skip) > " --height=40% --layout=reverse --border)
+
+    case "$option" in
+        "Me ($CURRENT_USER)") echo "$CURRENT_USER" ;;
+        "Unassigned") echo "x" ;;
+        "Search/Manual...")
+            read -p "Enter assignee email/name: " manual_assignee
+            echo "$manual_assignee"
+            ;;
+        *) echo "" ;; # Cancelled/ESC returns empty
+    esac
+}
+
+select_reporter() {
+    local option
+    option=$(echo -e "Me ($CURRENT_USER)\nSearch/Manual..." | \
+        fzf --prompt="Reporter (ESC to skip) > " --height=40% --layout=reverse --border)
+
+    case "$option" in
+        "Me ($CURRENT_USER)") echo "$CURRENT_USER" ;;
+        "Search/Manual...")
+            read -p "Enter reporter email/name: " manual_reporter
+            echo "$manual_reporter"
+            ;;
+        *) echo "" ;; # Cancelled/ESC returns empty
+    esac
+}
+
+# ==============================================================================
+# JIRA ACTIONS
+# ==============================================================================
+
+perform_create_issue() {
     echo "Creating issue in project: $CURRENT_PROJECT"
 
     # 1. Summary
-    read -p "Summary: " SUMMARY
-    if [[ -z "$SUMMARY" ]]; then
-        echo "Summary is required. Aborting."
-        sleep 1
-        return
+    read -p "Summary: " summary
+    if [[ -z "$summary" ]]; then
+        log_error "Summary is required. Aborting."
+        sleep 1; return
     fi
 
-    # 2. Issue Type
-    local TYPE=$(echo -e "Task\nStory\nBug\nEpic\nSub-task" | \
-        fzf --prompt="Issue Type > " --height=40% --layout=reverse --border)
-    [[ -z "$TYPE" ]] && return
+    # 2. Type
+    local type
+    type=$(select_issue_type)
+    [[ -z "$type" ]] && return
 
-    # 3. Epic Selection (Parent)
-    local EPIC_FLAG=""
-    local EPIC_KEY=""
-    if [[ "$TYPE" != "Epic" ]]; then
-        echo "Fetching Epics..."
-        local SELECTED_EPIC=$(jira epic list --table --plain --no-headers --project="$CURRENT_PROJECT" 2>/dev/null | \
-            fzf --prompt="Link to Epic (Optional, ESC to skip) > " --height=40% --layout=reverse --border --header="Select parent Epic")
-        if [[ -n "$SELECTED_EPIC" ]]; then
-            EPIC_KEY=$(echo "$SELECTED_EPIC" | awk '{print $2}')
-            EPIC_FLAG="-P$EPIC_KEY"
+    # 3. Epic
+    local epic_selection=""
+    local epic_key=""
+    local epic_flag=""
+    if [[ "$type" != "Epic" ]]; then
+        epic_selection=$(select_epic)
+        if [[ -n "$epic_selection" ]]; then
+            # Extract KEY from "KEY SUMMARY" format
+            epic_key=$(echo "$epic_selection" | awk '{print }')
+            [[ -n "$epic_key" ]] && epic_flag="-P$epic_key"
         fi
     fi
 
     # 4. Assignee
-    local ASSIGNEE_OPT=$(echo -e "Me ($CURRENT_USER)\nUnassigned\nSearch/Manual..." | \
-        fzf --prompt="Assignee > " --height=40% --layout=reverse --border)
+    local assignee
+    assignee=$(select_assignee)
+    # If assignee is empty (ESC), we proceed as Unassigned (no -a flag)
 
-    local ASSIGNEE=""
-    case "$ASSIGNEE_OPT" in
-        "Me ($CURRENT_USER)") ASSIGNEE="$CURRENT_USER" ;;
-        "Unassigned") ASSIGNEE="x" ;;
-        "Search/Manual...") read -p "Enter assignee email/name: " ASSIGNEE ;;
-        *) return ;; # Cancelled
-    esac
+    # 5. Reporter
+    local reporter
+    reporter=$(select_reporter)
 
-    # 5. Labels (Interactive Selection)
-    local LABELS_SOURCE=$(get_recent_labels)
-    local FZF_LABELS=$(echo "$LABELS_SOURCE" | \
-        fzf --multi --print-query --prompt="Labels (Tab to select, Enter to add query) > " --height=40% --layout=reverse --border --header="Recently used labels")
+    # 6. Labels
+    local -a selected_labels
+    mapfile -t selected_labels < <(select_generic_multi "Labels" "get_labels" "save_item_to_file" "Label" "$LABEL_FILE")
 
-    local LABEL_FLAGS=""
-    if [[ -n "$FZF_LABELS" ]]; then
-        # If no items selected, use the query itself
-        if [[ $(echo "$FZF_LABELS" | wc -l) -eq 1 ]]; then
-            LABEL_FLAGS="-l$(echo "$FZF_LABELS" | head -n1)"
-        else
-            # Skip the first line (query) if multiple lines (selections) exist
-            while read -r label; do
-                [[ -z "$label" ]] && continue
-                LABEL_FLAGS="$LABEL_FLAGS -l$label"
-            done <<< "$(echo "$FZF_LABELS" | tail -n+2)"
-        fi
-    fi
+    # 7. Components
+    local -a selected_components
+    mapfile -t selected_components < <(select_generic_multi "Components" "get_components" "save_item_to_file" "Component" "$COMPONENT_FILE")
 
-    # 6. Components
-    local COMPONENT_SOURCE=$(get_recent_components)
-    local FZF_COMPONENTS=$(echo "$COMPONENT_SOURCE" | \
-        fzf --multi --print-query --prompt="Components (Tab to select, Enter to add query) > " --height=40% --layout=reverse --border)
-
-    local COMPONENT_FLAGS=""
-    if [[ -n "$FZF_COMPONENTS" ]]; then
-        if [[ $(echo "$FZF_COMPONENTS" | wc -l) -eq 1 ]]; then
-            COMPONENT_FLAGS="-C$(echo "$FZF_COMPONENTS" | head -n1)"
-        else
-            while read -r component; do
-                [[ -z "$component" ]] && continue
-                COMPONENT_FLAGS="$COMPONENT_FLAGS -C$component"
-            done <<< "$(echo "$FZF_COMPONENTS" | tail -n+2)"
-        fi
-    fi
-
-    # 7. Description (Body)
+    # 8. Description
     echo "Description (Press CTRL-D to end, or just ENTER for empty):"
-    local BODY=$(cat)
+    local body
+    body=$(cat)
 
-    # Confirm
+    # Review
     clear
     echo "Review your issue:"
     echo "---------------------------"
     echo "Project:   $CURRENT_PROJECT"
-    echo "Type:      $TYPE"
-    echo "Summary:   $SUMMARY"
-    [[ -n "$EPIC_KEY" ]] && echo "Epic:      $EPIC_KEY"
-    echo "Assignee:  $ASSIGNEE"
-    # Format labels/components for display
-    local DISPLAY_LABELS=$(if [[ $(echo "$FZF_LABELS" | wc -l) -eq 1 ]]; then echo "$FZF_LABELS"; else echo "$FZF_LABELS" | tail -n+2 | tr '\n' ',' | sed 's/,$//'; fi)
-    local DISPLAY_COMPONENTS=$(if [[ $(echo "$FZF_COMPONENTS" | wc -l) -eq 1 ]]; then echo "$FZF_COMPONENTS"; else echo "$FZF_COMPONENTS" | tail -n+2 | tr '\n' ',' | sed 's/,$//'; fi)
-    echo "Labels:    $DISPLAY_LABELS"
-    echo "Components: $DISPLAY_COMPONENTS"
+    echo "Type:      $type"
+    echo "Summary:   $summary"
+    [[ -n "$epic_selection" ]] && echo "Epic:      $epic_selection"
+    echo "Assignee:  ${assignee:-(Project Default)}"
+    echo "Reporter:  ${reporter:-(Me)}"
+    echo "Labels:    ${selected_labels[*]:-None}"
+    echo "Components: ${selected_components[*]:-None}"
     echo "---------------------------"
-    read -p "Create this issue? [y/N]: " CONFIRM
-    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-        echo "Creating issue..."
-        jira issue create --no-input -p"$CURRENT_PROJECT" -t"$TYPE" -s"$SUMMARY" -a"$ASSIGNEE" $EPIC_FLAG $LABEL_FLAGS $COMPONENT_FLAGS -b"$BODY"
-    else
+
+    read -p "Create this issue? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "Aborted."
+        sleep 1; return
     fi
-    sleep 2
+
+    echo "Creating issue..."
+
+    # Construct Args
+    local -a args=("--no-input" "-p$CURRENT_PROJECT" "-t$type" "-s$summary")
+    [[ -n "$assignee" ]] && args+=("-a$assignee")
+    [[ -n "$reporter" ]] && args+=("-r$reporter")
+    [[ -n "$epic_flag" ]] && args+=("$epic_flag")
+    [[ -n "$body" ]] && args+=("-b$body")
+
+    for l in "${selected_labels[@]}"; do [[ -n "$l" ]] && args+=("-l$l"); done
+    for c in "${selected_components[@]}"; do [[ -n "$c" ]] && args+=("-C$c"); done
+
+    # Execute
+    local out
+    out=$(jira issue create "${args[@]}" 2>&1)
+    local res=$?
+
+    if [[ $res -eq 0 ]]; then
+        echo "Successfully created issue!"
+        echo "$out"
+    else
+        log_error "Error creating issue (Exit Code: $res):"
+        echo "$out"
+    fi
+
+    echo "Press any key to continue..."
+    read -n 1
 }
 
-view_issue_details() {
+view_issue_menu() {
     local key="$1"
     while true; do
         clear
-        # Show a decent summary at the top (first 15 lines)
         jira issue view "$key" --plain 2>/dev/null | head -n 15
         echo "---------------------------"
-        local ACTION=$(echo -e "1. View (Full/Pager)\n2. Comment\n3. Move/Transition\n4. Assign\n5. Open in Web\n6. Back" | \
-            fzf --prompt="Action for $key > " \
-                --height=45% \
-                --layout=reverse \
-                --border)
 
-        case "$ACTION" in
+        local action
+        action=$(echo -e "1. View (Full/Pager)\n2. Comment\n3. Move/Transition\n4. Assign\n5. Open in Web\n6. Back" | \
+            fzf --prompt="Action for $key > " --height=45% --layout=reverse --border)
+
+        case "$action" in
             "1. View (Full/Pager)")
                 clear
                 jira issue view "$key" | ${PAGER:-less -R}
                 ;;
             "2. Comment")
-                read -p "Comment: " COMMENT
-                if [[ -n "$COMMENT" ]]; then
-                    jira issue comment add "$key" "$COMMENT"
-                fi
+                read -p "Comment: " comment
+                [[ -n "$comment" ]] && jira issue comment add "$key" "$comment"
                 ;;
-            "3. Move/Transition")
-                jira issue move "$key"
-                ;;
+            "3. Move/Transition") jira issue move "$key" ;;
             "4. Assign")
-                read -p "Assign to (email or name): " ASSIGNEE
-                if [[ -n "$ASSIGNEE" ]]; then
-                    jira issue assign "$key" "$ASSIGNEE"
-                fi
+                read -p "Assign to (email or name): " assignee
+                [[ -n "$assignee" ]] && jira issue assign "$key" "$assignee"
                 ;;
-            "5. Open in Web")
-                jira open "$key"
-                ;;
-            "6. Back"|"")
-                return
-                ;;
+            "5. Open in Web") jira open "$key" ;;
+            "6. Back"|"") return ;;
         esac
     done
 }
 
-list_issues() {
+list_issues_flow() {
     local filter="$1"
     while true; do
-        local SELECTED=$(jira issue list $filter --project="$CURRENT_PROJECT" --plain --columns key,summary,status,assignee --no-headers --paginate 100 2>/dev/null | \
+        local selected
+        selected=$(jira issue list $filter --project="$CURRENT_PROJECT" --plain --columns key,summary,status,assignee --no-headers --paginate 100 2>/dev/null | \
             fzf --prompt="Issues > " \
                 --height=80% \
                 --layout=reverse \
@@ -229,56 +379,62 @@ list_issues() {
                 --preview 'jira issue view {1}' \
                 --bind 'ctrl-r:reload(jira issue list '$filter' --project="'$CURRENT_PROJECT'" --plain --columns key,summary,status,assignee --no-headers --paginate 100)')
 
-        if [[ -z "$SELECTED" ]]; then
+        if [[ -z "$selected" ]]; then
             return
         fi
 
-        local KEY=$(echo "$SELECTED" | awk '{print $1}')
-        view_issue_details "$KEY"
+        local key
+        key=$(echo "$selected" | awk '{print $1}')
+        view_issue_menu "$key"
     done
 }
 
-# Main Loop
-while true; do
-    clear
-    FZF_OUT=$(echo -e "1. List My Issues\n2. Create Issue\n3. Current Sprint\n4. Search Issues\n5. Exit" | \
-        fzf --prompt="Jira Action > " \
-            --height=40% \
-            --layout=reverse \
-            --border \
-            --cycle \
-            --header="User: [$CURRENT_USER] | Project: [$CURRENT_PROJECT] (CTRL-P: Change Project)" \
-            --info=inline \
-            --expect=ctrl-p)
+# ==============================================================================
+# MAIN ENTRYPOINT
+# ==============================================================================
 
-    KEY=$(parse_key "$FZF_OUT")
-    ACTION=$(parse_fzf "$FZF_OUT")
+main() {
+    check_dependencies
+    ensure_config_dirs
+    init_session
 
-    if [[ "$KEY" == "ctrl-p" ]]; then
-        select_project
-        continue
-    fi
+    while true; do
+        clear
+        local fzf_out
+        fzf_out=$(echo -e "1. List My Issues\n2. Create Issue\n3. Current Sprint\n4. Search Issues\n5. Exit" | \
+            fzf --prompt="Jira Action > " \
+                --height=40% \
+                --layout=reverse \
+                --border \
+                --cycle \
+                --header="User: [$CURRENT_USER] | Project: [$CURRENT_PROJECT] (CTRL-P: Change Project)" \
+                --info=inline \
+                --expect=ctrl-p)
 
-    case "$ACTION" in
-        "1. List My Issues")
-            list_issues "-a$CURRENT_USER"
-            ;;
-        "2. Create Issue")
-            create_issue
-            ;;
-        "3. Current Sprint")
-            jira sprint list --current --project="$CURRENT_PROJECT"
-            echo "Press any key to continue..."
-            read -n 1
-            ;;
-        "4. Search Issues")
-            read -p "Search query: " QUERY
-            if [[ -n "$QUERY" ]]; then
-                list_issues "$QUERY"
-            fi
-            ;;
-        "5. Exit"|"")
-            exit 0
-            ;;
-    esac
-done
+        local key
+        key=$(parse_fzf_key "$fzf_out")
+        local action
+        action=$(parse_fzf_selection "$fzf_out")
+
+        if [[ "$key" == "ctrl-p" ]]; then
+            select_project
+            continue
+        fi
+
+        case "$action" in
+            "1. List My Issues") list_issues_flow "-a$CURRENT_USER" ;;
+            "2. Create Issue") perform_create_issue ;;
+            "3. Current Sprint")
+                jira sprint list --current --assignee="$CURRENT_USER" --project="$CURRENT_PROJECT"
+                ;;
+            "4. Search Issues")
+                read -p "Search query: " query
+                [[ -n "$query" ]] && list_issues_flow "$query"
+                ;;
+            "5. Exit"|"") exit 0 ;;
+        esac
+    done
+}
+
+# Run Main
+main "$@"
