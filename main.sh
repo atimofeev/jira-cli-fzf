@@ -309,7 +309,7 @@ perform_create_issue() {
     echo "Creating issue..."
 
     # Construct Args
-    local -a args=("--no-input" "-p$CURRENT_PROJECT" "-t$type" "-s$summary")
+    local -a args=("--no-input" "--web" "-p$CURRENT_PROJECT" "-t$type" "-s$summary")
     [[ -n "$assignee" ]] && args+=("-a$assignee")
     [[ -n "$reporter" ]] && args+=("-r$reporter")
     [[ -n "$epic_flag" ]] && args+=("$epic_flag")
