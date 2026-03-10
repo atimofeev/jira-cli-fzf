@@ -259,7 +259,7 @@ perform_create_issue() {
         epic_selection=$(select_epic)
         if [[ -n "$epic_selection" ]]; then
             # Extract KEY from "KEY SUMMARY" format
-            epic_key=$(echo "$epic_selection" | awk '{print }')
+            epic_key=$(echo "$epic_selection" | awk '{print $1}')
             [[ -n "$epic_key" ]] && epic_flag="-P$epic_key"
         fi
     fi
