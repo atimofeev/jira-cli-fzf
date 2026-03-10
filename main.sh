@@ -142,7 +142,7 @@ select_generic_multi() {
                 --header-first --header="$header")
 
         local exit_code=$?
-        [[ $exit_code -ne 0 ]] && return # Cancelled
+        [[ $exit_code -ne 0 ]] && break # Cancelled or ESC, but keep what we have
 
         # Check for Create Option
         local creating_new=false
