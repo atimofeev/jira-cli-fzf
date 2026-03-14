@@ -232,6 +232,56 @@ select_reporter() {
     esac
 }
 
+select_sprint() {
+    local active_sprint
+    active_sprint=$(jira sprint list --table --plain --columns ID,NAME --state active --no-headers --project="$CURRENT_PROJECT" 2>/dev/null | head -n1)
+
+    if [[ -n "$active_sprint" ]]; then
+        local sprint_id=$(echo "$active_sprint" | awk '{print $1}')
+        local sprint_name=$(echo "$active_sprint" | cut -f2-)
+
+        echo "Current active sprint: $sprint_name" >&2
+        echo -n "Add to this sprint? (y/n/ESC to skip): " >&2
+
+        local char
+        read -r -s -n 1 char
+        if [[ "$char" == $'\e' ]]; then
+            echo "Skipped." >&2
+            return
+        fi
+
+        case "$char" in
+            [Yy])
+                echo "Yes" >&2
+                echo "$sprint_id|$sprint_name"
+                ;;
+            [Nn])
+                echo "No, selecting another..." >&2
+                local selected
+                selected=$(jira sprint list --table --plain --columns ID,NAME --state future,active --no-headers --project="$CURRENT_PROJECT" 2>/dev/null | \
+                    fzf --prompt="Select Sprint > " --height=40% --layout=reverse --border)
+                if [[ -n "$selected" ]]; then
+                    local sid=$(echo "$selected" | awk '{print $1}')
+                    local sname=$(echo "$selected" | cut -f2-)
+                    echo "$sid|$sname"
+                fi
+                ;;
+            *)
+                echo "Skipped." >&2
+                ;;
+        esac
+    else
+        local selected
+        selected=$(jira sprint list --table --plain --columns ID,NAME --state future,active --no-headers --project="$CURRENT_PROJECT" 2>/dev/null | \
+            fzf --prompt="Select Sprint (Optional, ESC to skip) > " --height=40% --layout=reverse --border)
+        if [[ -n "$selected" ]]; then
+            local sid=$(echo "$selected" | awk '{print $1}')
+            local sname=$(echo "$selected" | cut -f2-)
+            echo "$sid|$sname"
+        fi
+    fi
+}
+
 # ==============================================================================
 # JIRA ACTIONS
 # ==============================================================================
@@ -273,15 +323,21 @@ perform_create_issue() {
     local reporter
     reporter=$(select_reporter)
 
-    # 6. Labels
+    # 6. Sprint
+    local sprint_data
+    sprint_data=$(select_sprint)
+    local sprint_id=$(echo "$sprint_data" | cut -d'|' -f1)
+    local sprint_name=$(echo "$sprint_data" | cut -d'|' -f2)
+
+    # 7. Labels
     local -a selected_labels
     mapfile -t selected_labels < <(select_generic_multi "Labels" "get_labels" "save_item_to_file" "Label" "$LABEL_FILE")
 
-    # 7. Components
+    # 8. Components
     local -a selected_components
     mapfile -t selected_components < <(select_generic_multi "Components" "get_components" "save_item_to_file" "Component" "$COMPONENT_FILE")
 
-    # 8. Description
+    # 9. Description
     echo "Description (Press CTRL-D to end, or just ENTER for empty):"
     local body
     body=$(cat)
@@ -296,6 +352,7 @@ perform_create_issue() {
     [[ -n "$epic_selection" ]] && echo "Epic:      $epic_selection"
     echo "Assignee:  ${assignee:-(Project Default)}"
     echo "Reporter:  ${reporter:-(Me)}"
+    echo "Sprint:    ${sprint_name:-None}"
     echo "Labels:    ${selected_labels[*]:-None}"
     echo "Components: ${selected_components[*]:-None}"
     echo "---------------------------"
@@ -326,6 +383,15 @@ perform_create_issue() {
     if [[ $res -eq 0 ]]; then
         echo "Successfully created issue!"
         echo "$out"
+
+        # Add to sprint if selected
+        if [[ -n "$sprint_id" ]]; then
+            local key=$(echo "$out" | grep -oE '[A-Z]+-[0-9]+' | head -n1)
+            if [[ -n "$key" ]]; then
+                echo "Adding $key to sprint $sprint_name ($sprint_id)..."
+                jira sprint add "$sprint_id" "$key" >/dev/null
+            fi
+        fi
     else
         log_error "Error creating issue (Exit Code: $res):"
         echo "$out"
