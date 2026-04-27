@@ -40,12 +40,14 @@
                 pkgs.lib.makeBinPath [
                   pkgs.jira-cli-go
                   pkgs.fzf
-                  pkgs.gawk
-                  pkgs.gnused
-                  pkgs.gnugrep
-                  pkgs.findutils
-                  pkgs.coreutils
-                ]
+                pkgs.gawk
+                pkgs.gnused
+                pkgs.gnugrep
+                pkgs.jq
+                pkgs.curl
+                pkgs.findutils
+                pkgs.coreutils
+              ]
               }
           '';
 
@@ -62,6 +64,8 @@
           buildInputs = [
             pkgs.jira-cli-go
             pkgs.fzf
+            pkgs.jq
+            pkgs.curl
           ];
         };
       }
