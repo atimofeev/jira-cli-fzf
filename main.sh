@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# set -euo pipefail
+set -euo pipefail
 
 # ==============================================================================
 # CONFIG & INIT
 # ==============================================================================
 
+JIRA_CONF="${JIRA_CONFIG_FILE:-$HOME/.config/.jira/.config.yml}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jira-cli-fzf"
 mkdir -p "$CACHE_DIR"
 
@@ -13,10 +14,15 @@ if [[ -z "${JIRA_API_TOKEN:-}" ]]; then
     exit 1
 fi
 
-# Fetch context silently
 CURRENT_USER=$(jira me 2>/dev/null || true)
-CURRENT_PROJECT=$(jira project list --plain --no-headers 2>/dev/null | head -n1 | awk '{print $1}')
-[[ -z "$CURRENT_PROJECT" ]] && CURRENT_PROJECT="INFRA"
+CURRENT_PROJECT=$(awk '
+    $1 == "project:" {
+        if ($2 != "") { print $2; exit }
+        else { in_proj=1; next }
+    }
+    in_proj && $1 == "key:" { print $2; exit }
+    in_proj && /^[a-zA-Z]/ { in_proj=0 }
+' "$JIRA_CONF" 2>/dev/null | tr -d '"'\''')
 
 # ==============================================================================
 # API & CACHE
@@ -24,15 +30,13 @@ CURRENT_PROJECT=$(jira project list --plain --no-headers 2>/dev/null | head -n1 
 
 jira_api_get() {
     local path="$1"
-    # Extract config details directly from jira-cli config
-    local config_file="${JIRA_CONFIG_FILE:-$HOME/.config/.jira/.config.yml}"
-    local server=$(awk '/^[[:space:]]*server:/ {print $2; exit}' "$config_file" | tr -d '"'\')
-    local login=$(awk '/^[[:space:]]*login:/ {print $2; exit}' "$config_file" | tr -d '"'\')
+    local server=$(awk '/^[[:space:]]*server:/ {print $2; exit}' "$JIRA_CONF" | tr -d '"'\')
+    local login=$(awk '/^[[:space:]]*login:/ {print $2; exit}' "$JIRA_CONF" | tr -d '"'\')
 
     curl -fsS -u "${login}:${JIRA_API_TOKEN}" -H "Accept: application/json" "${server%/}${path}"
 }
 
-# Generic function to read from cache or fetch/cache via API
+# Generic function for non-paginated endpoints
 get_cached_api() {
     local type="$1"
     local endpoint="$2"
