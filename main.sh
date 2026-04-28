@@ -90,7 +90,7 @@ create_issue() {
 
     local epic=""
     if [[ "$type" != "Epic" ]]; then
-        epic=$(get_epics | select_single "Epic (ESC to skip)" | awk '{print $1}')
+        epic=$(get_epics | select_single "Epic (ESC to skip)" | awk '{print $1}') || true
     fi
 
     # Assignee selection (fzf selected on "Me", ESC sets to unassigned)
@@ -105,8 +105,8 @@ create_issue() {
     local reporter="$CURRENT_USER"
     if [[ -n "$r_sel" && "$r_sel" != "Me ($CURRENT_USER)" ]]; then reporter="$r_sel"; fi
 
-    local labels=$(get_labels | select_multi "Labels (ESC to skip)" | paste -sd, -)
-    local components=$(get_components | select_multi "Components (ESC to skip)" | paste -sd, -)
+    local labels=$(get_labels | select_multi "Labels (ESC to skip)" | paste -sd, -) || true
+    local components=$(get_components | select_multi "Components (ESC to skip)" | paste -sd, -) || true
 
     read -p "Summary: " summary
     [[ -z "$summary" ]] && return
