@@ -114,6 +114,26 @@ create_issue() {
     echo "Description (Press CTRL-D to end, or just ENTER for empty):"
     local body=$(cat)
 
+    # Human readable display for preview
+    local a_disp="$assignee"; [[ "$assignee" == "x" ]] && a_disp="Unassigned"
+
+    # Issue Preview
+    clear
+    echo "Review your issue:"
+    echo "---------------------------"
+    echo "Project:     $CURRENT_PROJECT"
+    echo "Type:        $type"
+    echo "Summary:     $summary"
+    [[ -n "$epic" ]] && echo "Epic:        $epic"
+    echo "Assignee:    $a_disp"
+    echo "Reporter:    $reporter"
+    echo "Labels:      ${labels:-None}"
+    echo "Components:  ${components:-None}"
+    echo "Description: ${body:-None}"
+    echo "---------------------------"
+    read -p "Create this issue? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "Aborted."; sleep 1; return; }
+
     # Build Jira CLI arguments
     local args=("--no-input" "-p$CURRENT_PROJECT" "-t$type" "-s$summary")
     [[ -n "$epic" ]] && args+=("-P$epic")
@@ -121,7 +141,6 @@ create_issue() {
     [[ -n "$reporter" ]] && args+=("-r$reporter")
     [[ -n "$body" ]] && args+=("-b$body")
 
-    # Process comma-separated multi-selects
     IFS=',' read -ra L_ARR <<< "$labels"
     for l in "${L_ARR[@]}"; do [[ -n "$l" ]] && args+=("-l$l"); done
 
