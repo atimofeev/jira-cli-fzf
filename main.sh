@@ -93,15 +93,20 @@ create_issue() {
         epic=$(get_epics | select_single "Epic (ESC to skip)" | awk '{print $1}')
     fi
 
-    local assignee=$( (echo "Unassigned"; get_users) | select_single "Assignee (ESC to skip)")
-    [[ "$assignee" == "Unassigned" ]] && assignee="x"
+    # Assignee selection (fzf selected on "Me", ESC sets to unassigned)
+    local a_sel=$( (echo "Me ($CURRENT_USER)"; get_users) | select_single "Assignee (ESC for Unassigned)") || true
+    local assignee="x"
+    if [[ "$a_sel" == "Me ($CURRENT_USER)" ]]; then assignee="$CURRENT_USER"
+    elif [[ -n "$a_sel" ]]; then assignee="$a_sel"
+    fi
 
-    local reporter=$( (echo "Me"; get_users) | select_single "Reporter (ESC to skip)")
-    [[ "$reporter" == "Me" ]] && reporter="$CURRENT_USER"
+    # Reporter selection (fzf selected on "Me", ESC sets to Me)
+    local r_sel=$( (echo "Me ($CURRENT_USER)"; get_users) | select_single "Reporter (ESC for Me)") || true
+    local reporter="$CURRENT_USER"
+    if [[ -n "$r_sel" && "$r_sel" != "Me ($CURRENT_USER)" ]]; then reporter="$r_sel"; fi
 
-    # Native FZF multi-select via TAB
-    local labels=$(get_labels | select_multi "Labels" | paste -sd, -)
-    local components=$(get_components | select_multi "Components" | paste -sd, -)
+    local labels=$(get_labels | select_multi "Labels (ESC to skip)" | paste -sd, -)
+    local components=$(get_components | select_multi "Components (ESC to skip)" | paste -sd, -)
 
     read -p "Summary: " summary
     [[ -z "$summary" ]] && return
