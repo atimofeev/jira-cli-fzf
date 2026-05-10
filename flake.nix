@@ -17,13 +17,17 @@
       let
         pkgs = import nixpkgs { inherit system; };
         pname = "jira-cli-fzf";
-        version = "0.1.0";
+        version =
+          let
+            rev = self.shortRev or "dirty";
+            date = self.lastModifiedDate or "0";
+          in
+          "${date}_${rev}";
       in
       {
         packages.default = pkgs.stdenv.mkDerivation {
           inherit pname version;
 
-          # proper source filtering
           src = pkgs.lib.cleanSource ./.;
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -34,20 +38,19 @@
             cp main.sh $out/bin/${pname}
             chmod +x $out/bin/${pname}
 
-            # wrap with runtime dependencies
             wrapProgram $out/bin/${pname} \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
                   pkgs.jira-cli-go
                   pkgs.fzf
-                pkgs.gawk
-                pkgs.gnused
-                pkgs.gnugrep
-                pkgs.jq
-                pkgs.curl
-                pkgs.findutils
-                pkgs.coreutils
-              ]
+                  pkgs.gawk
+                  pkgs.gnused
+                  pkgs.gnugrep
+                  pkgs.jq
+                  pkgs.curl
+                  pkgs.findutils
+                  pkgs.coreutils
+                ]
               }
           '';
 
