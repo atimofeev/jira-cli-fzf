@@ -20,5 +20,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |-
+          git fetch --tags --force
+          echo "## Summary" >> tag_message.txt
+          git tag -l --format='%(contents)' ${{ github.ref_name }} > tag_message.txt
+          echo "" >> tag_message.txt
+          echo "## Commits since last release" >> tag_message.txt
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 ${{ github.ref_name }}^ 2>/dev/null || true)
+          if [ -z "$PREVIOUS_TAG" ]; then
+            git log ${{ github.ref_name }} --pretty=format:"  - %s (%h)" >> tag_message.txt
+          else
+            git log ${PREVIOUS_TAG}..${{ github.ref_name }} --pretty=format:"  - %s (%h)" >> tag_message.txt
+          fi
           gh release create ${{ github.ref_name }} \
-            --title "${{ github.ref_name }}"
+            --title "${{ github.ref_name }}" \
+            --notes-file tag_message.txt \
+            --generate-notes
