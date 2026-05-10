@@ -9,11 +9,12 @@ JIRA_CONF="${JIRA_CONFIG_FILE:-$HOME/.config/.jira/.config.yml}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jira-cli-fzf"
 mkdir -p "$CACHE_DIR"
 
-if [[ -z "${JIRA_API_TOKEN:-}" ]]; then
-    echo "Error: JIRA_API_TOKEN environment variable is required for API access." >&2
-    exit 1
-fi
+[[ -z "${JIRA_API_TOKEN:-}" ]] && { echo "Error: JIRA_API_TOKEN is required." >&2; exit 1; }
 
+_awk_conf() { awk "/^[[:space:]]*${1}:/ {print \$2; exit}" "$JIRA_CONF" | tr -d '"'\'''; }
+
+JIRA_SERVER=$(_awk_conf server)
+JIRA_LOGIN=$(_awk_conf login)
 CURRENT_USER=$(jira me 2>/dev/null || true)
 CURRENT_PROJECT=$(awk '
     $1 == "project:" {
@@ -21,7 +22,7 @@ CURRENT_PROJECT=$(awk '
         else { in_proj=1; next }
     }
     in_proj && $1 == "key:" { print $2; exit }
-    in_proj && /^[a-zA-Z]/ { in_proj=0 }
+    in_proj && /^[a-zA-Z]/  { in_proj=0 }
 ' "$JIRA_CONF" 2>/dev/null | tr -d '"'\''')
 
 # ==============================================================================
@@ -29,63 +30,164 @@ CURRENT_PROJECT=$(awk '
 # ==============================================================================
 
 jira_api_get() {
-    local path="$1"
-    local server=$(awk '/^[[:space:]]*server:/ {print $2; exit}' "$JIRA_CONF" | tr -d '"'\')
-    local login=$(awk '/^[[:space:]]*login:/ {print $2; exit}' "$JIRA_CONF" | tr -d '"'\')
-
-    curl -fsS -u "${login}:${JIRA_API_TOKEN}" -H "Accept: application/json" "${server%/}${path}"
+    curl -fsS \
+        -u "${JIRA_LOGIN}:${JIRA_API_TOKEN}" \
+        -H "Accept: application/json" \
+        "${JIRA_SERVER%/}${1}"
 }
 
-# Generic function for non-paginated endpoints
-get_cached_api() {
-    local type="$1"
-    local endpoint="$2"
-    local jq_filter="$3"
+fetch_api_cached() {
+    local type="$1" endpoint="$2" jq_values="$3" jq_total="${4:-}"
     local cache_file="$CACHE_DIR/${CURRENT_PROJECT}_${type}.txt"
 
     if [[ ! -s "$cache_file" ]]; then
-        jira_api_get "$endpoint" | jq -r "$jq_filter" | sed '/^$/d' | sort -u > "$cache_file"
+        > "$cache_file"
+        if [[ -z "$jq_total" ]]; then
+            jira_api_get "$endpoint" | jq -r "$jq_values" | sed '/^$/d' >> "$cache_file"
+        else
+            local start=0 page_size=100 total=1
+            while [[ $start -lt $total ]]; do
+                local sep; sep=$( [[ "$endpoint" == *"?"* ]] && echo "&" || echo "?" )
+                local response
+                response=$(jira_api_get "${endpoint}${sep}startAt=${start}&maxResults=${page_size}")
+                total=$(echo "$response" | jq -r "$jq_total")
+
+                # Ensure total is an integer to prevent bash arithmetic evaluation errors
+                [[ "$total" =~ ^[0-9]+$ ]] || total=0
+
+                echo "$response" | jq -r "$jq_values" | sed '/^$/d' >> "$cache_file"
+                start=$((start + page_size))
+            done
+        fi
+        sort -u -o "$cache_file" "$cache_file"
     fi
     cat "$cache_file"
 }
 
-get_project_id() {
-    jira_api_get "/rest/api/3/project/${CURRENT_PROJECT}" | jq -r '.id'
+# ==============================================================================
+# DATA SOURCES
+# ==============================================================================
+
+CURRENT_PROJECT_ID=$(jira_api_get "/rest/api/3/project/${CURRENT_PROJECT}" | jq -r '.id')
+[[ -z "$CURRENT_PROJECT_ID" || "$CURRENT_PROJECT_ID" == "null" ]] && {
+    echo "Error: could not resolve project ID for '${CURRENT_PROJECT}'" >&2; exit 1
 }
 
-# ==============================================================================
-# DATA SOURCES (Strictly API)
-# ==============================================================================
-
 get_issue_types() {
-    get_cached_api "issue_types" "/rest/api/3/issuetype/project?projectId=$(get_project_id)" '.[]?.name // .values[]?.name'
+    fetch_api_cached "issue_types" \
+        "/rest/api/3/issuetype/project?projectId=${CURRENT_PROJECT_ID}" \
+        '.[]?.name // .values[]?.name'
 }
 
 get_epics() {
-    get_cached_api "epics" "/rest/api/3/search/jql?jql=project=${CURRENT_PROJECT}%20AND%20issuetype=Epic&maxResults=100&fields=summary" '.issues[]? | "\(.key) \(.fields.summary)"'
+    local cache_file="$CACHE_DIR/${CURRENT_PROJECT}_epics.txt"
+
+    if [[ ! -s "$cache_file" ]]; then
+        > "$cache_file"
+        local page_size=100
+        local next_page_token=""
+
+        # Clean any hidden carriage returns from the project key
+        local proj="${CURRENT_PROJECT//$'\r'/}"
+
+        while true; do
+            local json_body
+            # Build the payload (injecting nextPageToken only if we have one)
+            if [[ -z "$next_page_token" ]]; then
+                json_body=$(jq -n \
+                    --arg jql "project=\"$proj\" AND issuetype=Epic" \
+                    --argjson max "$page_size" \
+                    '{jql: $jql, maxResults: $max, fields: ["summary"]}')
+            else
+                json_body=$(jq -n \
+                    --arg jql "project=\"$proj\" AND issuetype=Epic" \
+                    --argjson max "$page_size" \
+                    --arg token "$next_page_token" \
+                    '{jql: $jql, maxResults: $max, fields: ["summary"], nextPageToken: $token}')
+            fi
+
+            local response
+            response=$(curl -sS -X POST \
+                -u "${JIRA_LOGIN}:${JIRA_API_TOKEN}" \
+                -H "Accept: application/json" \
+                -H "Content-Type: application/json" \
+                -d "$json_body" \
+                "${JIRA_SERVER%/}/rest/api/3/search/jql")
+
+            # Check if Jira explicitly returned an error message
+            local error_msg
+            error_msg=$(echo "$response" | jq -r '.errorMessages[0] // empty')
+            if [[ -n "$error_msg" ]]; then
+                echo "Jira API Error: $error_msg" >&2
+                rm -f "$cache_file"
+                return 1
+            fi
+
+            # Append this page's results to the cache
+            echo "$response" | jq -r '.issues[]? | "\(.key) \(.fields.summary)"' | sed '/^$/d' >> "$cache_file"
+
+            # The new endpoint uses nextPageToken instead of startAt for pagination
+            next_page_token=$(echo "$response" | jq -r '.nextPageToken // empty')
+
+            # If no token is returned, or it is explicitly "null", we have reached the end
+            [[ -z "$next_page_token" || "$next_page_token" == "null" ]] && break
+        done
+
+        sort -u -o "$cache_file" "$cache_file"
+    fi
+
+    cat "$cache_file"
 }
 
 get_users() {
-    get_cached_api "users" "/rest/api/3/user/assignable/search?project=${CURRENT_PROJECT}&maxResults=1000" '.[]? | select(.active) | (.emailAddress // .displayName)'
+    local cache_file="$CACHE_DIR/${CURRENT_PROJECT}_users.txt"
+    if [[ ! -s "$cache_file" ]]; then
+        > "$cache_file"
+        local start=0 page_size=1000
+        while true; do
+            local response
+            response=$(jira_api_get "/rest/api/3/users/search?startAt=${start}&maxResults=${page_size}")
+            local count
+            count=$(echo "$response" | jq 'length')
+            [[ "$count" -eq 0 ]] && break
+            echo "$response" \
+                | jq -r '.[] | select(.accountType == "atlassian") | (.emailAddress // .displayName)' \
+                | sed '/^$/d' >> "$cache_file"
+            start=$((start + page_size))
+            [[ "$count" -lt "$page_size" ]] && break
+        done
+        sort -u -o "$cache_file" "$cache_file"
+    fi
+    cat "$cache_file"
 }
 
 get_labels() {
-    get_cached_api "labels" "/rest/api/3/search/jql?jql=project=${CURRENT_PROJECT}%20AND%20labels%20is%20not%20EMPTY&maxResults=100&fields=labels" '.issues[]?.fields.labels[]?'
+    fetch_api_cached "labels" \
+        "/rest/api/3/label" \
+        '.values[]?' \
+        '.total'
 }
 
 get_components() {
-    get_cached_api "components" "/rest/api/3/project/${CURRENT_PROJECT}/components" '.[]?.name'
+    fetch_api_cached "components" \
+        "/rest/api/3/project/${CURRENT_PROJECT}/components" \
+        '.[]?.name'
 }
 
 # ==============================================================================
-# UI CONTROLS & FLOWS
+# UI HELPERS
 # ==============================================================================
 
 select_single() { fzf --prompt="$1 > " --height=40% --layout=reverse --border; }
 select_multi()  { fzf -m --prompt="$1 (TAB multi-select) > " --height=40% --layout=reverse --border; }
 
+# ==============================================================================
+# FLOWS
+# ==============================================================================
+
 create_issue() {
-    local type=$(get_issue_types | select_single "Issue Type")
+    local type
+    type=$(get_issue_types | select_single "Issue Type") || return
     [[ -z "$type" ]] && return
 
     local epic=""
@@ -93,64 +195,63 @@ create_issue() {
         epic=$(get_epics | select_single "Epic (ESC to skip)" | awk '{print $1}') || true
     fi
 
-    # Assignee selection (fzf selected on "Me", ESC sets to unassigned)
-    local a_sel=$( (echo "Me ($CURRENT_USER)"; get_users) | select_single "Assignee (ESC for Unassigned)") || true
+    local a_sel
+    a_sel=$( (echo "Me ($CURRENT_USER)"; get_users) | select_single "Assignee (ESC for Unassigned)") || true
     local assignee="x"
-    if [[ "$a_sel" == "Me ($CURRENT_USER)" ]]; then assignee="$CURRENT_USER"
-    elif [[ -n "$a_sel" ]]; then assignee="$a_sel"
-    fi
+    [[ "$a_sel" == "Me ($CURRENT_USER)" ]] && assignee="$CURRENT_USER"
+    [[ -n "$a_sel" && "$a_sel" != "Me ($CURRENT_USER)" ]] && assignee="$a_sel"
 
-    # Reporter selection (fzf selected on "Me", ESC sets to Me)
-    local r_sel=$( (echo "Me ($CURRENT_USER)"; get_users) | select_single "Reporter (ESC for Me)") || true
+    local r_sel
+    r_sel=$( (echo "Me ($CURRENT_USER)"; get_users) | select_single "Reporter (ESC for Me)") || true
     local reporter="$CURRENT_USER"
-    if [[ -n "$r_sel" && "$r_sel" != "Me ($CURRENT_USER)" ]]; then reporter="$r_sel"; fi
+    [[ -n "$r_sel" && "$r_sel" != "Me ($CURRENT_USER)" ]] && reporter="$r_sel"
 
-    local labels=$(get_labels | select_multi "Labels (ESC to skip)" | paste -sd, -) || true
-    local components=$(get_components | select_multi "Components (ESC to skip)" | paste -sd, -) || true
+    local labels components
+    labels=$(get_labels     | select_multi "Labels (ESC to skip)"     | paste -sd, -) || true
+    components=$(get_components | select_multi "Components (ESC to skip)" | paste -sd, -) || true
 
-    read -p "Summary: " summary
+    local summary
+    read -rp "Summary: " summary
     [[ -z "$summary" ]] && return
 
-    echo "Description (Press CTRL-D to end, or just ENTER for empty):"
-    local body=$(cat)
+    echo "Description (CTRL-D to end, ENTER for empty):"
+    local body; body=$(cat)
 
-    # Human readable display for preview
     local a_disp="$assignee"; [[ "$assignee" == "x" ]] && a_disp="Unassigned"
 
-    # Issue Preview
     clear
-    echo "Review your issue:"
-    echo "---------------------------"
-    echo "Project:     $CURRENT_PROJECT"
-    echo "Type:        $type"
-    echo "Summary:     $summary"
-    [[ -n "$epic" ]] && echo "Epic:        $epic"
-    echo "Assignee:    $a_disp"
-    echo "Reporter:    $reporter"
-    echo "Labels:      ${labels:-None}"
-    echo "Components:  ${components:-None}"
-    echo "Description: ${body:-None}"
-    echo "---------------------------"
-    read -p "Create this issue? [y/N]: " confirm
+    cat <<-EOF
+		Review your issue:
+		---------------------------
+		Project:     $CURRENT_PROJECT
+		Type:        $type
+		Summary:     $summary
+		Epic:        ${epic:-N/A}
+		Assignee:    $a_disp
+		Reporter:    $reporter
+		Labels:      ${labels:-None}
+		Components:  ${components:-None}
+		Description: ${body:-None}
+		---------------------------
+		EOF
+
+    local confirm
+    read -rp "Create this issue? [y/N]: " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "Aborted."; sleep 1; return; }
 
-    # Build Jira CLI arguments
     local args=("--no-input" "-p$CURRENT_PROJECT" "-t$type" "-s$summary")
-    [[ -n "$epic" ]] && args+=("-P$epic")
-    [[ -n "$assignee" ]] && args+=("-a$assignee")
+    [[ -n "$epic" ]]     && args+=("-P$epic")
+    [[ "$assignee" != "x" ]] && args+=("-a$assignee")
     [[ -n "$reporter" ]] && args+=("-r$reporter")
-    [[ -n "$body" ]] && args+=("-b$body")
+    [[ -n "$body" ]]     && args+=("-b$body")
 
-    IFS=',' read -ra L_ARR <<< "$labels"
-    for l in "${L_ARR[@]}"; do [[ -n "$l" ]] && args+=("-l$l"); done
-
-    IFS=',' read -ra C_ARR <<< "$components"
-    for c in "${C_ARR[@]}"; do [[ -n "$c" ]] && args+=("-C$c"); done
+    local item
+    IFS=',' read -ra L_ARR <<< "$labels";     for item in "${L_ARR[@]}"; do [[ -n "$item" ]] && args+=("-l$item"); done
+    IFS=',' read -ra C_ARR <<< "$components"; for item in "${C_ARR[@]}"; do [[ -n "$item" ]] && args+=("-C$item"); done
 
     echo -e "\nCreating issue..."
     jira issue create "${args[@]}" || true
-
-    read -n 1 -s -r -p "Press any key to return to menu..."
+    read -n 1 -srp "Press any key to return to menu..."
 }
 
 view_issue() {
@@ -159,14 +260,16 @@ view_issue() {
         clear
         jira issue view "$key" --plain 2>/dev/null | head -n 15
         echo "---------------------------"
-        local action=$(echo -e "1. View Full\n2. Comment\n3. Transition\n4. Open in Web\n5. Back" | select_single "Action")
+        local action
+        action=$(printf '%s\n' "1. View Full" "2. Comment" "3. Transition" "4. Open in Web" "5. Back" \
+            | select_single "Action") || return
 
         case "$action" in
             "1"*) jira issue view "$key" | ${PAGER:-less -R} ;;
-            "2"*) read -p "Comment: " c; [[ -n "$c" ]] && jira issue comment add "$key" "$c" ;;
+            "2"*) local c; read -rp "Comment: " c; [[ -n "$c" ]] && jira issue comment add "$key" "$c" ;;
             "3"*) jira issue move "$key" ;;
             "4"*) jira open "$key" ;;
-            *) return ;;
+            *)    return ;;
         esac
     done
 }
@@ -174,10 +277,11 @@ view_issue() {
 list_issues() {
     local filter="$1"
     while true; do
-        local selection=$(jira issue list $filter --project="$CURRENT_PROJECT" --plain --columns key,summary,status --no-headers | \
-            fzf --prompt="Issues > " --height=80% --layout=reverse --preview 'jira issue view {1}')
-        [[ -z "$selection" ]] && return
-        view_issue $(echo "$selection" | awk '{print $1}')
+        local selection
+        selection=$(jira issue list $filter --project="$CURRENT_PROJECT" --plain --columns key,summary,status --no-headers | \
+            fzf --prompt="Issues > " --height=80% --layout=reverse --preview 'jira issue view {1}') || break
+        [[ -z "$selection" ]] && break
+        view_issue "$(echo "$selection" | awk '{print $1}')"
     done
 }
 
@@ -187,14 +291,18 @@ list_issues() {
 
 while true; do
     clear
-    action=$(echo -e "1. List My Issues\n2. Create Issue\n3. Search Issues\n4. Refresh API Cache\n5. Exit" | \
-        fzf --prompt="Main Menu > " --header="User: $CURRENT_USER | Project: $CURRENT_PROJECT" --height=40% --layout=reverse)
+    action=$(printf '%s\n' "1. List My Issues" "2. Create Issue" "3. Search Issues" "4. Refresh API Cache" "5. Exit" | \
+        fzf --prompt="Main Menu > " --header="User: $CURRENT_USER | Project: $CURRENT_PROJECT" --height=40% --layout=reverse) || true
 
     case "$action" in
         "1"*) list_issues "-a$CURRENT_USER" ;;
         "2"*) create_issue ;;
-        "3"*) read -p "JQL/Text Query: " q; [[ -n "$q" ]] && list_issues "$q" ;;
+        "3"*)
+            q=""
+            read -rp "JQL/Text Query: " q
+            [[ -n "$q" ]] && list_issues "$q"
+            ;;
         "4"*) rm -f "$CACHE_DIR/${CURRENT_PROJECT}_"*.txt; echo "Cache cleared."; sleep 1 ;;
-        *) exit 0 ;;
+        *)    exit 0 ;;
     esac
 done
